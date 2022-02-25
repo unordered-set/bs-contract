@@ -2141,6 +2141,7 @@ dependencies = [
 name = "solana-bpf-helloworld"
 version = "0.0.1"
 dependencies = [
+ "arrayref",
  "borsh",
  "borsh-derive",
  "solana-program",
