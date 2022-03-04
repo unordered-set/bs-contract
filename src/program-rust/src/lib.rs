@@ -100,7 +100,11 @@ pub struct EventBets {
     pub bets_betors: Vec<Pubkey>,
     pub bets_lamports: Vec<u64>,
     pub bets_outcomes: Vec<u8>,
+    pub bets_withdrawals: Vec<bool>,
 }
+
+const PERMANENT_LEN: usize = 1 + 32 + 8 + 1 + 4 + 4 + 4 + 4;
+const DYNAMIC_ITEM_SIZE: usize =             32 + 8 + 1 + 1;
 
 fn pack_match_outcome(value: MatchOutcome) -> u8{
     match value {
@@ -188,12 +192,15 @@ pub enum Instruction {
     // Accepted accounts:
     //    [readable, signed] - owner account, signed, mostly to avoid fat finger errors.
     //    [writable] - bets account
-    Initialize,
+    Initialize{
+        bets_accepted_until: UnixTimestamp,
+    },
 
     // Adds a bet
     // Accepted accounts:
     //    [writable] - betor
     //    [writable] - bets account
+    //    [writable] - tmp account with SOLs to deposit
     AddBet{
         choice: MatchOutcome,
     },
@@ -218,7 +225,14 @@ impl Instruction {
         use ProgramError::InvalidInstructionData;
         let (&tag, rest) = input.split_first().ok_or(InvalidInstructionData)?;
         Ok(match tag {
-            0 => Self::Initialize,
+            0 => {
+                let bets_accepted_until = rest
+                    .get(..8)
+                    .and_then(|slice| slice.try_into().ok())
+                    .map(UnixTimestamp::from_le_bytes)
+                    .ok_or(InvalidInstructionData)?;
+                Self::Initialize { bets_accepted_until }
+            },
             1 => {
                 let (&choice, rest) = rest.split_first().ok_or(InvalidInstructionData)?;
                 Self::AddBet { choice: unpack_match_outcome(choice)? }
@@ -237,8 +251,7 @@ pub fn cmp_pubkeys(a: &Pubkey, b: &Pubkey) -> bool {
     sol_memcmp(a.as_ref(), b.as_ref(), PUBKEY_BYTES) == 0
 }
 
-fn _process_initialize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    msg!("Instruction: _process_initialize");
+fn _process_initialize(program_id: &Pubkey, bets_accepted_until: UnixTimestamp, accounts: &[AccountInfo]) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
     let owner = next_account_info(account_info_iter)?;
     if (!owner.is_signer) {
@@ -258,43 +271,40 @@ fn _process_initialize(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
         return Err(ProgramError::InvalidAccountData)
     }
 
-    if bets_info.data_len() < 48057 {
+    if bets_info.data_len() < PERMANENT_LEN {
         msg!("Instruction: _process_initialize: buffer is too small");
-        return Err(ProgramError::InvalidAccountData)
+        return Err(ProgramError::InvalidAccountData);
     }
     
-    //let mut bets = EventBets::unpack_unchecked(&bets_info.data.borrow())?;
     let mut bets = EventBets::deserialize(&mut &bets_info.data.borrow()[..])?;
-    msg!("Instruction: _process_initialize: Unpacked");
     if bets.is_initialized {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    msg!("Instruction: _process_initialize: Initializing...");
+
+    if bets_accepted_until < Clock::get()?.unix_timestamp {
+        msg!("Bets accepted until {} but now it is {}", bets_accepted_until, Clock::get()?.unix_timestamp);
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    msg!("Instruction: _process_initialize: Initializing for {} bets",
+         (bets_info.data_len() - PERMANENT_LEN) / DYNAMIC_ITEM_SIZE);
 
     bets.is_initialized = true;
     bets.arbiter = *owner.key;
     bets.outcome = 0u8;
-    let timeout: i64 = 5 * 60;
-    bets.bets_allowed_until_ts = Clock::get()?.unix_timestamp + timeout;
+    bets.bets_allowed_until_ts = bets_accepted_until;
 
-    // EventBets::pack(bets, &mut bets_info.data.borrow_mut())?;
     bets.serialize(&mut &mut bets_info.data.borrow_mut()[..])?;
-
     Ok(())
 }
 
-fn _process_add_bet(program_id: &Pubkey, accounts: &[AccountInfo], choice: MatchOutcome, lamports: u64) -> ProgramResult {
-    msg!("Adding {} for resolution {}", lamports, pack_match_outcome(choice));
-
+fn _process_add_bet(program_id: &Pubkey, accounts: &[AccountInfo], choice: MatchOutcome) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
-    // let _ = next_account_info(account_info_iter)?;
     let betor = next_account_info(account_info_iter)?; 
-    msg!("Betor = {}", betor.key);
     let bets_info = next_account_info(account_info_iter)?;
-    msg!("bets_info = {}", bets_info.key);
     let tmp_storage_key = next_account_info(account_info_iter)?;
-    msg!("tmp_storage_key = {}", tmp_storage_key.key);
-
+    msg!("betor = {}, bets_info = {}, tmp_storage_key = {}", betor.key, bets_info.key, tmp_storage_key.key);
+    
     if !cmp_pubkeys(program_id, bets_info.owner) {
         msg!("Instruction: _process_add_bet: wrong owner for event {}", bets_info.owner);
         return Err(ProgramError::InvalidAccountData)
@@ -303,6 +313,7 @@ fn _process_add_bet(program_id: &Pubkey, accounts: &[AccountInfo], choice: Match
         msg!("Instruction: _process_add_bet: wrong owner for tmp storage");
         return Err(ProgramError::InvalidAccountData)
     }
+
     let mut bets = EventBets::deserialize(&mut &bets_info.data.borrow()[..])?;
     if !bets.is_initialized {
         msg!("Instruction: _process_add_bet: not Initialized...");
@@ -312,7 +323,18 @@ fn _process_add_bet(program_id: &Pubkey, accounts: &[AccountInfo], choice: Match
         msg!("Instruction: _process_add_bet: too late, bets are no longer accepted");
         return Err(ProgramError::InvalidAccountData);
     }
+    if unpack_match_outcome(bets.outcome)? != MatchOutcome::Unknown {
+        msg!("Betting on completed match");
+        return Err(ProgramError::InvalidAccountData);
+    }
 
+    let max_allowed_bets = (bets_info.data_len() - PERMANENT_LEN) / DYNAMIC_ITEM_SIZE;
+    if bets.bets_outcomes.len() >= max_allowed_bets {
+        msg!("Instruction: _process_add_bet: bets_info {} is full {}", bets_info.key, max_allowed_bets);
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    msg!("Adding {} for resolution {}", tmp_storage_key.lamports(), pack_match_outcome(choice));
     bets.bets_outcomes.push(pack_match_outcome(choice));
     bets.bets_betors.push(*betor.key);
     bets.bets_lamports.push(tmp_storage_key.lamports());
@@ -325,6 +347,40 @@ fn _process_add_bet(program_id: &Pubkey, accounts: &[AccountInfo], choice: Match
 }
 
 fn _process_set_winner(program_id: &Pubkey, accounts: &[AccountInfo], result: MatchOutcome) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let owner = next_account_info(account_info_iter)?; 
+    let bets_info = next_account_info(account_info_iter)?;
+    if !owner.is_signer {
+        msg!("Instruction: _process_set_winner: wrong signer");
+        return Err(ProgramError::MissingRequiredSignature)
+    }
+    let mut bets = EventBets::deserialize(&mut &bets_info.data.borrow()[..])?;
+    if !bets.is_initialized {
+        msg!("Instruction: _process_set_winner: not Initialized...");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if Clock::get()?.unix_timestamp < bets.bets_allowed_until_ts {
+        msg!("Instruction: _process_set_winner: too early");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if !cmp_pubkeys(&bets.arbiter, owner.key) {
+        msg!("Instruction: _process_set_winner: you are not an arbiter");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if result == MatchOutcome::Unknown {
+        msg!("Can not set result back to Unknown");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    
+    if unpack_match_outcome(bets.outcome)? == MatchOutcome::Unknown {
+        msg!("Sending funds from {} to {}", bets_info.key, owner.key);
+        let comission = bets_info.lamports() / 100 * 3;
+        **bets_info.try_borrow_mut_lamports()? -= comission;
+        **owner.try_borrow_mut_lamports()? += comission;
+    }
+    bets.outcome = pack_match_outcome(result);
+    bets.serialize(&mut &mut bets_info.data.borrow_mut()[..])?;
+
     Ok(())
 }
 
@@ -343,9 +399,10 @@ pub fn process_instruction(
     _instruction_data: &[u8], // Ignored, all helloworld instructions are hellos
 ) -> ProgramResult {
     let instruction = Instruction::unpack(_instruction_data)?;
+    msg!("UNpacked");
 
     match instruction {
-        Instruction::Initialize => _process_initialize(program_id, accounts),
+        Instruction::Initialize{bets_accepted_until} => _process_initialize(program_id, bets_accepted_until, accounts),
         Instruction::AddBet{choice} => _process_add_bet(program_id, accounts, choice),
         Instruction::SetWinner{result} => _process_set_winner(program_id, accounts, result),
         Instruction::Withdraw => _process_withdraw(program_id, accounts),
