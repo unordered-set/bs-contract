@@ -6,12 +6,12 @@ use solana_program::{
     program_error::ProgramError,
     pubkey::{Pubkey, PUBKEY_BYTES},
     clock::{UnixTimestamp, Clock},
-    program_pack::{IsInitialized, Pack, Sealed},
-    program_memory::{sol_memcmp, sol_memset},
+    program_memory::{sol_memcmp},
     sysvar::{rent::Rent, Sysvar},
 };
 use borsh::{BorshDeserialize, BorshSerialize};
-use arrayref::{array_mut_ref, array_ref, array_refs, mut_array_refs};
+
+const COMISSION: u8 = 3;
 
 
 use borsh::maybestd::{
@@ -24,7 +24,8 @@ pub enum MatchOutcome {
     Unknown,
     TeamA,
     TeamB,
-    Draw
+    Draw,
+    Withdrawn,
 }
 
 impl Default for MatchOutcome {
@@ -40,6 +41,7 @@ impl BorshSerialize for MatchOutcome {
             MatchOutcome::TeamA => 1u8.serialize(writer),
             MatchOutcome::TeamB => 2u8.serialize(writer),
             MatchOutcome::Draw => 3u8.serialize(writer),
+            MatchOutcome::Withdrawn => 255u8.serialize(writer),
         }
     }
 }
@@ -57,39 +59,11 @@ impl BorshDeserialize for MatchOutcome {
             1 => Ok(Self::TeamA),
             2 => Ok(Self::TeamB),
             3 => Ok(Self::Draw),
+            255 => Ok(Self::Withdrawn),
             _ => Err(Error::new(ErrorKind::InvalidInput, "MatchOutcome_bad_input"))
         }
     }
 }
-
-// #[repr(C)]
-// #[derive(Clone, Copy, Debug, Default, PartialEq)]
-// pub struct Bet {
-//     betor: Pubkey,
-//     lamports: u64,
-//     expected_outcome: MatchOutcome,
-// }
-
-// #[repr(C)]
-// #[derive(Clone, Copy, Debug, Default, PartialEq)]
-// pub struct EventBets {
-//     is_initialized: bool,                  // 1
-//     arbiter: Pubkey,                       // 32
-//     bets_allowed_until_ts: UnixTimestamp,  // 8
-//     outcome: MatchOutcome,                   // 8
-//     total_bets: usize,                     // 8
-//     bets_raw: [u8; 48000], // Lazy unpack of [Bet,1000];  // 1000 * (32 + 8 + 8)
-// }
-
-// impl Default for EventBets {
-//     fn default() -> Self {
-//         is_initialized: bool(),
-//         arbiter: Pubkey(),
-//         bets_allowed_until_ts: UnixTimestamp(),
-//         total_bets: 0,
-//         bets_raw: [0; 48000],
-//     }
-// }
 
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct EventBets {
@@ -97,14 +71,20 @@ pub struct EventBets {
     pub arbiter: Pubkey,
     pub bets_allowed_until_ts: UnixTimestamp,
     pub outcome: u8,
-    pub bets_betors: Vec<Pubkey>,
-    pub bets_lamports: Vec<u64>,
-    pub bets_outcomes: Vec<u8>,
-    pub bets_withdrawals: Vec<bool>,
+    pub balance_a: u64,
+    pub balance_b: u64,
 }
 
-const PERMANENT_LEN: usize = 1 + 32 + 8 + 1 + 4 + 4 + 4 + 4;
-const DYNAMIC_ITEM_SIZE: usize =             32 + 8 + 1 + 1;
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct Bet {
+    pub is_initialized: bool,
+    pub betor: Pubkey,
+    pub event: Pubkey,
+    pub amount: u64,
+    pub outcome: u8,
+}
+
+const BETS_RENT_EXCEMPTION: u64 = 1405920;
 
 fn pack_match_outcome(value: MatchOutcome) -> u8{
     match value {
@@ -112,6 +92,7 @@ fn pack_match_outcome(value: MatchOutcome) -> u8{
         MatchOutcome::TeamA => 1,
         MatchOutcome::TeamB => 2,
         MatchOutcome::Draw => 3,
+        MatchOutcome::Withdrawn => 255,
     }
 }
 fn unpack_match_outcome(src: u8) -> Result<MatchOutcome, ProgramError> {
@@ -123,68 +104,6 @@ fn unpack_match_outcome(src: u8) -> Result<MatchOutcome, ProgramError> {
         _ => Err(ProgramError::InvalidAccountData),
     }
 }
-
-/*
-impl Sealed for EventBets {}
-
-fn pack_public_key(key: &Pubkey, dst: &mut [u8; 32]) {
-    dst.copy_from_slice(key.as_ref());
-}
-fn unpack_public_key(src: &[u8; 32]) -> Pubkey {
-    Pubkey::new_from_array(*src)
-}
-
-
-
-
-impl Pack for EventBets {
-    const LEN: usize = 48057;
-    fn unpack_from_slice(src: &[u8]) -> Result<Self, ProgramError> {
-        let src = array_ref![src, 0, 48057];
-        let (is_initialized, arbiter, bets_allowed_until_ts, outcome, total_bets, bets_raw) =
-            array_refs![src, 1, 32, 8, 8, 8, 48000];
-        let is_initialized = match is_initialized {
-            [0] => false,
-            [1] => true,
-            _ => return Err(ProgramError::InvalidAccountData),
-        };
-        let outcome = match outcome[0] {
-            0 => MatchOutcome::Unknown,
-            1 => MatchOutcome::TeamA,
-            2 => MatchOutcome::TeamB,
-            3 => MatchOutcome::Draw,
-            _ => return Err(ProgramError::InvalidAccountData),
-        };
-        Ok(EventBets{
-            is_initialized,
-            arbiter: unpack_public_key(arbiter),
-            bets_allowed_until_ts: i64::from_le_bytes(*bets_allowed_until_ts),
-            outcome,
-            total_bets: usize::from_le_bytes(*total_bets),
-            bets_raw: *bets_raw,
-        })
-    }
-
-    fn pack_into_slice(&self, dst: &mut [u8]) {
-        let dst = array_mut_ref![dst, 0, 48056];
-        let (
-            //is_initialized_dst,
-            arbiter_dst,
-            bets_allowed_until_ts_dst,
-            result_dst,
-            total_bets_dst,
-            bets_raw_dst
-        ) = mut_array_refs![dst, 32, 8, 8, 8, 48000];
-        *is_initialized_dst = [self.is_initialized as u8];
-        pack_public_key(&self.arbiter, arbiter_dst);
-        *bets_allowed_until_ts_dst = self.bets_allowed_until_ts.to_le_bytes();
-        result_dst[0] = pack_match_outcome(self.outcome);
-        *total_bets_dst = self.total_bets.to_le_bytes();
-        *bets_raw_dst = self.bets_raw;
-    }
-}
-*/
-
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
@@ -201,6 +120,7 @@ pub enum Instruction {
     //    [writable] - betor
     //    [writable] - bets account
     //    [writable] - tmp account with SOLs to deposit
+    //    [writable] - bet info
     AddBet{
         choice: MatchOutcome,
     },
@@ -216,6 +136,7 @@ pub enum Instruction {
     // Withdraw your win
     //    [readable] - betor (no need to be signed, bc. it's ok if someone else decides to withdraw for you)
     //    [writable] - bets account
+    //    [writable] - bet info
     Withdraw,
 }
 
@@ -254,7 +175,7 @@ pub fn cmp_pubkeys(a: &Pubkey, b: &Pubkey) -> bool {
 fn _process_initialize(program_id: &Pubkey, bets_accepted_until: UnixTimestamp, accounts: &[AccountInfo]) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
     let owner = next_account_info(account_info_iter)?;
-    if (!owner.is_signer) {
+    if !owner.is_signer {
         msg!("Instruction: _process_initialize: wrong signer");
         return Err(ProgramError::MissingRequiredSignature)
     }
@@ -270,11 +191,6 @@ fn _process_initialize(program_id: &Pubkey, bets_accepted_until: UnixTimestamp, 
         msg!("Instruction: _process_initialize: wrong owner");
         return Err(ProgramError::InvalidAccountData)
     }
-
-    if bets_info.data_len() < PERMANENT_LEN {
-        msg!("Instruction: _process_initialize: buffer is too small");
-        return Err(ProgramError::InvalidAccountData);
-    }
     
     let mut bets = EventBets::deserialize(&mut &bets_info.data.borrow()[..])?;
     if bets.is_initialized {
@@ -286,37 +202,49 @@ fn _process_initialize(program_id: &Pubkey, bets_accepted_until: UnixTimestamp, 
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    msg!("Instruction: _process_initialize: Initializing for {} bets",
-         (bets_info.data_len() - PERMANENT_LEN) / DYNAMIC_ITEM_SIZE);
-
     bets.is_initialized = true;
     bets.arbiter = *owner.key;
     bets.outcome = 0u8;
     bets.bets_allowed_until_ts = bets_accepted_until;
+    bets.balance_a = 0;
+    bets.balance_b = 0;
 
     bets.serialize(&mut &mut bets_info.data.borrow_mut()[..])?;
     Ok(())
 }
 
 fn _process_add_bet(program_id: &Pubkey, accounts: &[AccountInfo], choice: MatchOutcome) -> ProgramResult {
+    // What can go wrong?
+    // `bets_info_acc` does not belong to our program, and someone scams our users.
+    // `this_bet_acc` does not belong to our program, again possible scam, but actually don't think it is achievable.
+    // `this_bet_acc` does not have enough funds to be rent excepmpted. Pretty bad, users may be disappointed.
+    // `bets_info` is wrong, uninitnalized - users can be scammed by betting to something else.
+    // `bets_info.bets_allowed_until_ts` is in the past.
+    // `bets_info.outcome` is not yet set (it should not, but just in case)...
+
     let account_info_iter = &mut accounts.iter();
     let betor = next_account_info(account_info_iter)?; 
-    let bets_info = next_account_info(account_info_iter)?;
-    let tmp_storage_key = next_account_info(account_info_iter)?;
-    msg!("betor = {}, bets_info = {}, tmp_storage_key = {}", betor.key, bets_info.key, tmp_storage_key.key);
-    
-    if !cmp_pubkeys(program_id, bets_info.owner) {
-        msg!("Instruction: _process_add_bet: wrong owner for event {}", bets_info.owner);
-        return Err(ProgramError::InvalidAccountData)
-    }
-    if !cmp_pubkeys(program_id, tmp_storage_key.owner) {
-        msg!("Instruction: _process_add_bet: wrong owner for tmp storage");
-        return Err(ProgramError::InvalidAccountData)
-    }
+    let bets_info_acc = next_account_info(account_info_iter)?;
+    let this_bet_acc = next_account_info(account_info_iter)?;
 
-    let mut bets = EventBets::deserialize(&mut &bets_info.data.borrow()[..])?;
+    msg!("betor = {}, bets_info = {}, this_bet_acc = {}", betor.key, bets_info_acc.key, this_bet_acc.key);
+    if !cmp_pubkeys(program_id, bets_info_acc.owner) {
+        msg!("Instruction: _process_add_bet: wrong owner for event {}", bets_info_acc.owner);
+        return Err(ProgramError::InvalidAccountData)
+    }
+    if !cmp_pubkeys(program_id, this_bet_acc.owner) {
+        msg!("Instruction: _process_add_bet: wrong owner for event {}", this_bet_acc.owner);
+        return Err(ProgramError::InvalidAccountData)
+    }
+    
+    let mut bets = EventBets::deserialize(&mut &bets_info_acc.data.borrow()[..])?;
+    let mut this_bet = Bet::deserialize(&mut &this_bet_acc.data.borrow()[..])?;
     if !bets.is_initialized {
-        msg!("Instruction: _process_add_bet: not Initialized...");
+        msg!("Instruction: _process_add_bet: BetInfo should be Initialized...");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if this_bet.is_initialized {
+        msg!("Instruction: _process_add_bet: Bet is already Initialized...");
         return Err(ProgramError::InvalidAccountData);
     }
     if Clock::get()?.unix_timestamp > bets.bets_allowed_until_ts {
@@ -328,21 +256,25 @@ fn _process_add_bet(program_id: &Pubkey, accounts: &[AccountInfo], choice: Match
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let max_allowed_bets = (bets_info.data_len() - PERMANENT_LEN) / DYNAMIC_ITEM_SIZE;
-    if bets.bets_outcomes.len() >= max_allowed_bets {
-        msg!("Instruction: _process_add_bet: bets_info {} is full {}", bets_info.key, max_allowed_bets);
-        return Err(ProgramError::InvalidAccountData);
-    }
+    msg!("Adding {} for resolution {}", this_bet_acc.lamports(), pack_match_outcome(choice));
+    this_bet.is_initialized = true;
+    this_bet.outcome = pack_match_outcome(choice);
+    this_bet.betor = *betor.key;
+    this_bet.amount = this_bet_acc.lamports() - BETS_RENT_EXCEMPTION;
+    this_bet.event = *bets_info_acc.key;
 
-    msg!("Adding {} for resolution {}", tmp_storage_key.lamports(), pack_match_outcome(choice));
-    bets.bets_outcomes.push(pack_match_outcome(choice));
-    bets.bets_betors.push(*betor.key);
-    bets.bets_lamports.push(tmp_storage_key.lamports());
-    msg!("Sending funds from {} to {}", tmp_storage_key.key, bets_info.key);
-    **bets_info.try_borrow_mut_lamports()? += tmp_storage_key.lamports();
-    **tmp_storage_key.try_borrow_mut_lamports()? = 0;
+    match choice {
+        MatchOutcome::TeamA => { bets.balance_a += this_bet.amount; },
+        MatchOutcome::TeamB => { bets.balance_b += this_bet.amount; },
+        _ => { return Err(ProgramError::InvalidAccountData); },
+    };
 
-    bets.serialize(&mut &mut bets_info.data.borrow_mut()[..])?;
+    msg!("Sending funds from {} to {}", this_bet_acc.key, bets_info_acc.key);
+    **bets_info_acc.try_borrow_mut_lamports()? += this_bet.amount;
+    **this_bet_acc.try_borrow_mut_lamports()? = BETS_RENT_EXCEMPTION;
+
+    bets.serialize(&mut &mut bets_info_acc.data.borrow_mut()[..])?;
+    this_bet.serialize(&mut &mut this_bet_acc.data.borrow_mut()[..])?;
     Ok(())
 }
 
@@ -374,7 +306,7 @@ fn _process_set_winner(program_id: &Pubkey, accounts: &[AccountInfo], result: Ma
     
     if unpack_match_outcome(bets.outcome)? == MatchOutcome::Unknown {
         msg!("Sending funds from {} to {}", bets_info.key, owner.key);
-        let comission = bets_info.lamports() / 100 * 3;
+        let comission: u64 = bets_info.lamports() * (COMISSION as u64) / 100u64;
         **bets_info.try_borrow_mut_lamports()? -= comission;
         **owner.try_borrow_mut_lamports()? += comission;
     }
@@ -385,6 +317,78 @@ fn _process_set_winner(program_id: &Pubkey, accounts: &[AccountInfo], result: Ma
 }
 
 fn _process_withdraw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let betor = next_account_info(account_info_iter)?; 
+    let bets_info = next_account_info(account_info_iter)?;
+    let this_bet_acc = next_account_info(account_info_iter)?;
+
+    msg!("betor = {}, bets_info = {}, this_bet_acc = {}", betor.key, bets_info.key, this_bet_acc.key);
+    
+    if !cmp_pubkeys(program_id, bets_info.owner) {
+        msg!("Instruction: _process_add_bet: wrong owner for event {}", bets_info.owner);
+        return Err(ProgramError::InvalidAccountData)
+    }
+    
+    let bets = EventBets::deserialize(&mut &bets_info.data.borrow()[..])?;
+    let mut this_bet = Bet::deserialize(&mut &this_bet_acc.data.borrow()[..])?;
+
+    if !cmp_pubkeys(bets_info.key, &this_bet.event) {
+        msg!("Bet does not match event");
+        return Err(ProgramError::InvalidAccountData)
+    }
+    if this_bet.betor != *betor.key {
+        msg!("Withdrawing to foreigner account");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if unpack_match_outcome(bets.outcome)? != MatchOutcome::Unknown {
+        msg!("Betting on completed match");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let withdraw_balance = match (unpack_match_outcome(bets.outcome)?, unpack_match_outcome(this_bet.outcome)?) {
+        (MatchOutcome::TeamA, MatchOutcome::TeamA) => {
+            let mut result = 1u128;
+            result *= bets.balance_b as u128;
+            result *= this_bet.amount as u128;
+            result /= bets.balance_a as u128;
+            result += this_bet.amount as u128;
+            result *= (100-COMISSION) as u128;
+            result /= 100u128;
+            result
+        },
+        (MatchOutcome::TeamB, MatchOutcome::TeamB) => {
+            let mut result = 1u128;
+            result *= bets.balance_a as u128;
+            result *= this_bet.amount as u128;
+            result /= bets.balance_b as u128;
+            result += this_bet.amount as u128;
+            result *= (100-COMISSION) as u128;
+            result /= 100u128;
+            result
+        },
+        (MatchOutcome::Draw, MatchOutcome::TeamA) | (MatchOutcome::Draw, MatchOutcome::TeamB)=> {
+            let mut result = 0u128;
+            result += this_bet.amount as u128;
+            result *= (100-COMISSION) as u128;
+            result /= 100u128;
+            result
+        },
+        _ => 0
+    };
+
+    if withdraw_balance > bets_info.lamports().into() {
+        msg!("Withdrawing too much: {}", withdraw_balance);
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    this_bet.outcome = pack_match_outcome(MatchOutcome::Withdrawn);
+    msg!("Sending {} lamports from {} to {}", withdraw_balance, bets_info.key, betor.key);
+    **bets_info.try_borrow_mut_lamports()? -= withdraw_balance as u64;
+    **betor.try_borrow_mut_lamports()? += withdraw_balance as u64;
+
+    bets.serialize(&mut &mut bets_info.data.borrow_mut()[..])?;
+    this_bet.serialize(&mut &mut this_bet_acc.data.borrow_mut()[..])?;
+
     Ok(())
 }
 
